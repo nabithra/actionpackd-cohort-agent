@@ -122,9 +122,9 @@ async function askGemini(chatId: number, userText: string): Promise<string> {
 
 const bot = new Bot(TELEGRAM_BOT_TOKEN);
 
-// Same words as the greet in instructions.md. Blank line before the question.
+// Same words as the greet in instructions.md.
 const NINJA_GREETING =
-  "Hi! I'm Ninja, an AI agent built at Actionpackd. In our cohort, you'll build agents like me.\n\nCan I ask a few quick questions to find the right fit for you?";
+  "Hi! I'm Ninja, an AI agent built at Actionpackd. And guess what? In our cohort, you'll learn to build AI agents just like me! ✨\n\nI'd love to ask you a few quick questions to understand your interests and help you find the right fit for the cohort.\n\nFirst, what's your name?";
 
 /** Clear the chat and send Ninja's intro once. The next message continues from here. */
 async function greetFresh(ctx: Context): Promise<void> {
