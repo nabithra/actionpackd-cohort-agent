@@ -36,6 +36,7 @@ const MAX_HISTORY = 20;
 
 // Wait times before each of the 3 retries
 const RETRY_WAITS_MS = [1000, 3000, 6000];
+const GEMINI_TIMEOUT_MS = 20_000;
 
 function getHistory(chatId: number): Content[] {
   return chatHistory.get(chatId) ?? [];
@@ -54,10 +55,57 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** True for transient Gemini failures worth retrying. */
+class TimeoutError extends Error {
+  constructor(ms: number) {
+    super(`Gemini call timed out after ${ms}ms`);
+    this.name = "TimeoutError";
+  }
+}
+
+/** Reject if the promise takes longer than ms. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new TimeoutError(ms)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** True for transient failures worth retrying (HTTP + network + timeout). */
 function isRetryableGeminiError(err: unknown): boolean {
-  const status = err instanceof ApiError ? err.status : undefined;
-  return status === 503 || status === 429 || status === 500;
+  if (err instanceof TimeoutError) return true;
+  if (err instanceof ApiError) {
+    return err.status === 503 || err.status === 429 || err.status === 500;
+  }
+  const msg = errorMessage(err).toLowerCase();
+  return (
+    msg.includes("fetch failed") ||
+    msg.includes("timeout") ||
+    msg.includes("timed out") ||
+    msg.includes("econnreset") ||
+    msg.includes("enotfound") ||
+    msg.includes("network") ||
+    msg.includes("socket")
+  );
+}
+
+/** Model returned 400 about thinking — drop thinkingConfig and retry. */
+function isThinkingConfigRejected(err: unknown): boolean {
+  if (!(err instanceof ApiError) || err.status !== 400) return false;
+  const msg = errorMessage(err).toLowerCase();
+  return msg.includes("thinking") || msg.includes("budget");
 }
 
 function is409Conflict(err: unknown): boolean {
@@ -83,19 +131,41 @@ function splitMessage(text: string, maxLen = 4000): string[] {
   return chunks;
 }
 
-async function generateOnce(model: string, contents: Content[]) {
-  return ai.models.generateContent({
-    model,
-    contents,
-    config: {
-      systemInstruction,
-      temperature: 0.3,
-      // No Google Search grounding
-    },
-  });
+async function callGemini(
+  model: string,
+  contents: Content[],
+  withThinkingOff: boolean
+) {
+  return withTimeout(
+    ai.models.generateContent({
+      model,
+      contents,
+      config: {
+        systemInstruction,
+        temperature: 0.3,
+        // No Google Search grounding
+        ...(withThinkingOff
+          ? { thinkingConfig: { thinkingBudget: 0 } }
+          : {}),
+      },
+    }),
+    GEMINI_TIMEOUT_MS
+  );
 }
 
-/** Call Gemini; on 503/429/500 retry up to 3 times (1s, 3s, 6s). */
+/** One Gemini call with 20s timeout; skip thinkingConfig if the model rejects it. */
+async function generateOnce(model: string, contents: Content[]) {
+  try {
+    // Turn off thinking for speed
+    return await callGemini(model, contents, true);
+  } catch (err) {
+    if (!isThinkingConfigRejected(err)) throw err;
+    console.warn(`Model ${model} rejected thinkingConfig; retrying without it`);
+    return await callGemini(model, contents, false);
+  }
+}
+
+/** Call Gemini; retry transient errors up to 3 times (1s, 3s, 6s). */
 async function generateWithRetries(model: string, contents: Content[]) {
   let lastErr: unknown;
 
@@ -109,8 +179,14 @@ async function generateWithRetries(model: string, contents: Content[]) {
       if (!canRetry) throw err;
 
       const wait = RETRY_WAITS_MS[attempt];
+      const label =
+        err instanceof ApiError
+          ? String(err.status)
+          : err instanceof TimeoutError
+            ? "timeout"
+            : "network";
       console.warn(
-        `Gemini error ${err instanceof ApiError ? err.status : "?"} on ${model}; retrying in ${wait}ms (${attempt + 1}/3)…`
+        `Gemini ${label} on ${model}; retrying in ${wait}ms (${attempt + 1}/3)…`
       );
       await sleep(wait);
     }
@@ -180,8 +256,13 @@ bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
   const userText = ctx.message.text;
 
-  // Show "typing…" while we wait for Gemini
-  await ctx.replyWithChatAction("typing");
+  // Keep "typing…" alive (Telegram expires it after a few seconds)
+  const sendTyping = () =>
+    ctx.replyWithChatAction("typing").catch(() => {
+      /* ignore */
+    });
+  await sendTyping();
+  const typingTimer = setInterval(sendTyping, 4000);
 
   try {
     const reply = await askGemini(chatId, userText);
@@ -196,6 +277,8 @@ bot.on("message:text", async (ctx) => {
     await ctx.reply(
       "Sorry, something went wrong. Please try again in a minute."
     );
+  } finally {
+    clearInterval(typingTimer);
   }
 });
 
