@@ -209,11 +209,11 @@ bot.on("message", async (ctx) => {
   );
 });
 
-// Catch unexpected errors so the bot never crashes
+// Log handler errors without crashing
 bot.catch((err) => {
   if (is409Conflict(err.error)) {
     console.warn(
-      "Warning: 409 Conflict — another bot instance may be polling. Stop other instances."
+      "Warning: 409 Conflict — another bot instance may be polling."
     );
     return;
   }
@@ -221,30 +221,44 @@ bot.catch((err) => {
 });
 
 // Clean shutdown for Railway restarts
-process.once("SIGINT", () => bot.stop());
-process.once("SIGTERM", () => bot.stop());
+process.once("SIGINT", () => {
+  bot.stop().finally(() => process.exit(0));
+});
+process.once("SIGTERM", () => {
+  bot.stop().finally(() => process.exit(0));
+});
 
 async function main() {
   // Clear any leftover webhook so long polling can run
-  await bot.api.deleteWebhook({ drop_pending_updates: false });
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: false });
+  } catch (err) {
+    console.warn("deleteWebhook failed (continuing):", err);
+  }
 
   console.log("Actionpackd Cohort Agent is starting (long polling)…");
 
-  try {
-    await bot.start();
-  } catch (err) {
-    // getUpdates 409 should warn, not crash the process
-    if (is409Conflict(err)) {
-      console.warn(
-        "Warning: 409 Conflict — another getUpdates is running. Stop other instances."
-      );
-      return;
+  // Keep the process alive; on 409 wait and start again
+  while (true) {
+    try {
+      await bot.start();
+      // bot.start() resolves after bot.stop() — exit the loop
+      break;
+    } catch (err) {
+      if (is409Conflict(err)) {
+        console.warn(
+          "Warning: 409 Conflict — another getUpdates is running. Retrying in 5s…"
+        );
+        await sleep(5000);
+        continue;
+      }
+      console.error("bot.start() error:", err);
+      await sleep(5000);
     }
-    throw err;
   }
 }
 
 main().catch((err) => {
-  console.error("Fatal startup error:", err);
-  process.exit(1);
+  // Never exit here — log and keep the event loop from ending abruptly
+  console.error("Startup error:", err);
 });
