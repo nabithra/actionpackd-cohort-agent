@@ -122,25 +122,26 @@ async function askGemini(chatId: number, userText: string): Promise<string> {
 
 const bot = new Bot(TELEGRAM_BOT_TOKEN);
 
-// /start — reset history and welcome the user
-bot.command("start", async (ctx) => {
+// Same words as the greet in instructions.md. Blank line before the question.
+const NINJA_GREETING =
+  "Hi! I'm Ninja, an AI agent built at Actionpackd. In our cohort, you'll build agents like me.\n\nCan I ask 2 quick questions to find the right fit for you?";
+
+/** Clear the chat and send Ninja's intro once. The next message continues from here. */
+async function greetFresh(ctx: Context): Promise<void> {
+  if (!ctx.chat) return;
   const chatId = ctx.chat.id;
   resetHistory(chatId);
+  await ctx.reply(NINJA_GREETING);
+  // Gemini history must start with a user turn, so "/start" stands in for this command.
+  setHistory(chatId, [
+    { role: "user", parts: [{ text: "/start" }] },
+    { role: "model", parts: [{ text: NINJA_GREETING }] },
+  ]);
+}
 
-  await ctx.reply(
-    "Hi! I'm the Actionpackd Cohort Agent 👋\n\n" +
-      "Ask me anything about the cohort — I'll do my best to help.\n\n" +
-      "Commands:\n" +
-      "/start — start fresh\n" +
-      "/reset — clear our conversation"
-  );
-});
-
-// /reset — clear history and confirm
-bot.command("reset", async (ctx) => {
-  resetHistory(ctx.chat.id);
-  await ctx.reply("Conversation cleared. What's next?");
-});
+// /start and /reset — same greeting, no command list
+bot.command("start", greetFresh);
+bot.command("reset", greetFresh);
 
 /** True when Telegram rejected parse_mode HTML ("can't parse entities"). */
 function isHtmlParseError(err: unknown): boolean {
@@ -234,6 +235,16 @@ async function main() {
     await bot.api.deleteWebhook({ drop_pending_updates: false });
   } catch (err) {
     console.warn("deleteWebhook failed (continuing):", err);
+  }
+
+  // So /start and /reset show in Telegram's menu button
+  try {
+    await bot.api.setMyCommands([
+      { command: "start", description: "Start fresh" },
+      { command: "reset", description: "Clear our conversation" },
+    ]);
+  } catch (err) {
+    console.warn("setMyCommands failed (continuing):", err);
   }
 
   console.log("Actionpackd Cohort Agent is starting (long polling)…");
