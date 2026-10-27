@@ -26,7 +26,9 @@ A Telegram bot for the Actionpackd cohort. It uses **grammY** (long polling) and
    |----------|----------|-------------|
    | `TELEGRAM_BOT_TOKEN` | Yes | Token from BotFather |
    | `GEMINI_API_KEY` | Yes | Google AI Studio API key |
-   | `GEMINI_MODEL` | No | Defaults to `gemini-flash-latest` |
+   | `GEMINI_MODEL` | No | Primary model. Defaults to `gemini-3.6-flash` |
+   | `GEMINI_FALLBACK_MODEL` | No | Second model. Defaults to `gemini-flash-lite-latest`, then `gemini-3.5-flash-lite` |
+   | `GEMINI_FALLBACK_MODELS` | No | Comma-separated fallbacks. If set, replaces the fallback list |
 
 3. Edit `instructions.md` with the cohort system prompt you want.
 
@@ -55,7 +57,9 @@ A Telegram bot for the Actionpackd cohort. It uses **grammY** (long polling) and
 
    - `TELEGRAM_BOT_TOKEN`
    - `GEMINI_API_KEY`
-   - `GEMINI_MODEL` (optional; defaults to `gemini-flash-latest`)
+   - `GEMINI_MODEL` (optional; defaults to `gemini-3.6-flash`)
+   - `GEMINI_FALLBACK_MODEL` (optional; defaults to `gemini-flash-lite-latest`)
+   - `GEMINI_FALLBACK_MODELS` (optional comma-separated fallbacks)
 
 4. Build / start (Railway usually detects these from `package.json`):
 
