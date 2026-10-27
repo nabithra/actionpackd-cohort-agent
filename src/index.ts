@@ -1,8 +1,8 @@
 import "dotenv/config";
 import { readFileSync } from "fs";
 import { join } from "path";
-import { Bot } from "grammy";
-import { GoogleGenAI, type Content } from "@google/genai";
+import { Bot, GrammyError } from "grammy";
+import { ApiError, GoogleGenAI, type Content } from "@google/genai";
 
 // --- Config (fail fast if required env vars are missing) ---
 
@@ -17,6 +17,8 @@ function requireEnv(name: string): string {
 const TELEGRAM_BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");
 const GEMINI_API_KEY = requireEnv("GEMINI_API_KEY");
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
+const GEMINI_FALLBACK_MODEL =
+  process.env.GEMINI_FALLBACK_MODEL || "gemini-2.5-flash";
 
 // Load system prompt from repo root (works from both src/ and dist/)
 const systemInstruction = readFileSync(
@@ -32,6 +34,9 @@ const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 const chatHistory = new Map<number, Content[]>();
 const MAX_HISTORY = 20;
 
+// Wait times before each of the 3 retries
+const RETRY_WAITS_MS = [1000, 3000, 6000];
+
 function getHistory(chatId: number): Content[] {
   return chatHistory.get(chatId) ?? [];
 }
@@ -43,6 +48,20 @@ function setHistory(chatId: number, history: Content[]): void {
 
 function resetHistory(chatId: number): void {
   chatHistory.delete(chatId);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** True for transient Gemini failures worth retrying. */
+function isRetryableGeminiError(err: unknown): boolean {
+  const status = err instanceof ApiError ? err.status : undefined;
+  return status === 503 || status === 429 || status === 500;
+}
+
+function is409Conflict(err: unknown): boolean {
+  return err instanceof GrammyError && err.error_code === 409;
 }
 
 /** Split a long reply into chunks under Telegram's safe limit. */
@@ -64,6 +83,42 @@ function splitMessage(text: string, maxLen = 4000): string[] {
   return chunks;
 }
 
+async function generateOnce(model: string, contents: Content[]) {
+  return ai.models.generateContent({
+    model,
+    contents,
+    config: {
+      systemInstruction,
+      temperature: 0.3,
+      // No Google Search grounding
+    },
+  });
+}
+
+/** Call Gemini; on 503/429/500 retry up to 3 times (1s, 3s, 6s). */
+async function generateWithRetries(model: string, contents: Content[]) {
+  let lastErr: unknown;
+
+  for (let attempt = 0; attempt <= RETRY_WAITS_MS.length; attempt++) {
+    try {
+      return await generateOnce(model, contents);
+    } catch (err) {
+      lastErr = err;
+      const canRetry =
+        isRetryableGeminiError(err) && attempt < RETRY_WAITS_MS.length;
+      if (!canRetry) throw err;
+
+      const wait = RETRY_WAITS_MS[attempt];
+      console.warn(
+        `Gemini error ${err instanceof ApiError ? err.status : "?"} on ${model}; retrying in ${wait}ms (${attempt + 1}/3)…`
+      );
+      await sleep(wait);
+    }
+  }
+
+  throw lastErr;
+}
+
 async function askGemini(chatId: number, userText: string): Promise<string> {
   const history = getHistory(chatId);
 
@@ -73,15 +128,17 @@ async function askGemini(chatId: number, userText: string): Promise<string> {
     { role: "user", parts: [{ text: userText }] },
   ];
 
-  const response = await ai.models.generateContent({
-    model: GEMINI_MODEL,
-    contents,
-    config: {
-      systemInstruction,
-      temperature: 0.3,
-      // No Google Search grounding
-    },
-  });
+  let response;
+  try {
+    response = await generateWithRetries(GEMINI_MODEL, contents);
+  } catch (err) {
+    // Still failing after retries → one shot with the fallback model
+    if (!isRetryableGeminiError(err)) throw err;
+    console.warn(
+      `Primary model failed; trying fallback ${GEMINI_FALLBACK_MODEL}…`
+    );
+    response = await generateOnce(GEMINI_FALLBACK_MODEL, contents);
+  }
 
   const reply = response.text?.trim() || "I don't have a response for that.";
 
@@ -154,6 +211,12 @@ bot.on("message", async (ctx) => {
 
 // Catch unexpected errors so the bot never crashes
 bot.catch((err) => {
+  if (is409Conflict(err.error)) {
+    console.warn(
+      "Warning: 409 Conflict — another bot instance may be polling. Stop other instances."
+    );
+    return;
+  }
   console.error("Bot error:", err);
 });
 
@@ -161,5 +224,27 @@ bot.catch((err) => {
 process.once("SIGINT", () => bot.stop());
 process.once("SIGTERM", () => bot.stop());
 
-console.log("Actionpackd Cohort Agent is starting (long polling)…");
-bot.start();
+async function main() {
+  // Clear any leftover webhook so long polling can run
+  await bot.api.deleteWebhook({ drop_pending_updates: false });
+
+  console.log("Actionpackd Cohort Agent is starting (long polling)…");
+
+  try {
+    await bot.start();
+  } catch (err) {
+    // getUpdates 409 should warn, not crash the process
+    if (is409Conflict(err)) {
+      console.warn(
+        "Warning: 409 Conflict — another getUpdates is running. Stop other instances."
+      );
+      return;
+    }
+    throw err;
+  }
+}
+
+main().catch((err) => {
+  console.error("Fatal startup error:", err);
+  process.exit(1);
+});
