@@ -124,7 +124,7 @@ const bot = new Bot(TELEGRAM_BOT_TOKEN);
 
 // Same words as the greet in instructions.md. Blank line before the question.
 const NINJA_GREETING =
-  "Hi! I'm Ninja, an AI agent built at Actionpackd. In our cohort, you'll build agents like me.\n\nCan I ask 2 quick questions to find the right fit for you?";
+  "Hi! I'm Ninja, an AI agent built at Actionpackd. In our cohort, you'll build agents like me.\n\nCan I ask a few quick questions to find the right fit for you?";
 
 /** Clear the chat and send Ninja's intro once. The next message continues from here. */
 async function greetFresh(ctx: Context): Promise<void> {
