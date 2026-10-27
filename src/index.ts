@@ -2,8 +2,15 @@ import "dotenv/config";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { Bot, Context, GrammyError } from "grammy";
-import { ApiError, GoogleGenAI, type Content } from "@google/genai";
+import { GoogleGenAI, type Content } from "@google/genai";
 import { htmlToPlainText, markdownToTelegramHtml, splitMessage } from "./format";
+import {
+  listGeminiModels,
+  TimeoutError,
+  TOTAL_BUDGET_MS,
+  tryModels,
+  usableHistory,
+} from "./gemini";
 
 // --- Config (fail fast if required env vars are missing) ---
 
@@ -17,9 +24,7 @@ function requireEnv(name: string): string {
 
 const TELEGRAM_BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");
 const GEMINI_API_KEY = requireEnv("GEMINI_API_KEY");
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-flash-latest";
-const GEMINI_FALLBACK_MODEL =
-  process.env.GEMINI_FALLBACK_MODEL || "gemini-2.5-flash";
+const GEMINI_MODELS = listGeminiModels();
 
 // Load system prompt from repo root (works from both src/ and dist/)
 const systemInstruction = readFileSync(
@@ -33,19 +38,14 @@ const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 // Chat history per Telegram chat id (last 20 messages max)
 const chatHistory = new Map<number, Content[]>();
-const MAX_HISTORY = 20;
-
-// Wait times before each of the 3 retries
-const RETRY_WAITS_MS = [1000, 3000, 6000];
-const GEMINI_TIMEOUT_MS = 20_000;
 
 function getHistory(chatId: number): Content[] {
   return chatHistory.get(chatId) ?? [];
 }
 
 function setHistory(chatId: number, history: Content[]): void {
-  // Keep only the last MAX_HISTORY messages
-  chatHistory.set(chatId, history.slice(-MAX_HISTORY));
+  // Keep pairs that start with the user. Never store a user turn that has no reply.
+  chatHistory.set(chatId, usableHistory(history));
 }
 
 function resetHistory(chatId: number): void {
@@ -54,13 +54,6 @@ function resetHistory(chatId: number): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-class TimeoutError extends Error {
-  constructor(ms: number) {
-    super(`Gemini call timed out after ${ms}ms`);
-    this.name = "TimeoutError";
-  }
 }
 
 /** Reject if the promise takes longer than ms. */
@@ -80,44 +73,12 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-/** True for transient failures worth retrying (HTTP + network + timeout). */
-function isRetryableGeminiError(err: unknown): boolean {
-  if (err instanceof TimeoutError) return true;
-  if (err instanceof ApiError) {
-    return err.status === 503 || err.status === 429 || err.status === 500;
-  }
-  const msg = errorMessage(err).toLowerCase();
-  return (
-    msg.includes("fetch failed") ||
-    msg.includes("timeout") ||
-    msg.includes("timed out") ||
-    msg.includes("econnreset") ||
-    msg.includes("enotfound") ||
-    msg.includes("network") ||
-    msg.includes("socket")
-  );
-}
-
-/** Model returned 400 about thinking — drop thinkingConfig and retry. */
-function isThinkingConfigRejected(err: unknown): boolean {
-  if (!(err instanceof ApiError) || err.status !== 400) return false;
-  const msg = errorMessage(err).toLowerCase();
-  return msg.includes("thinking") || msg.includes("budget");
-}
-
 function is409Conflict(err: unknown): boolean {
   return err instanceof GrammyError && err.error_code === 409;
 }
 
-async function callGemini(
-  model: string,
-  contents: Content[],
-  withThinkingOff: boolean
-) {
+/** One Gemini call. No thinkingConfig — some models return 400 if it is set. */
+function callGemini(model: string, contents: Content[], timeoutMs: number) {
   return withTimeout(
     ai.models.generateContent({
       model,
@@ -126,81 +87,29 @@ async function callGemini(
         systemInstruction,
         temperature: 0.3,
         // No Google Search grounding
-        ...(withThinkingOff
-          ? { thinkingConfig: { thinkingBudget: 0 } }
-          : {}),
       },
     }),
-    GEMINI_TIMEOUT_MS
+    timeoutMs
   );
 }
 
-/** One Gemini call with 20s timeout; skip thinkingConfig if the model rejects it. */
-async function generateOnce(model: string, contents: Content[]) {
-  try {
-    // Turn off thinking for speed
-    return await callGemini(model, contents, true);
-  } catch (err) {
-    if (!isThinkingConfigRejected(err)) throw err;
-    console.warn(`Model ${model} rejected thinkingConfig; retrying without it`);
-    return await callGemini(model, contents, false);
-  }
-}
-
-/** Call Gemini; retry transient errors up to 3 times (1s, 3s, 6s). */
-async function generateWithRetries(model: string, contents: Content[]) {
-  let lastErr: unknown;
-
-  for (let attempt = 0; attempt <= RETRY_WAITS_MS.length; attempt++) {
-    try {
-      return await generateOnce(model, contents);
-    } catch (err) {
-      lastErr = err;
-      const canRetry =
-        isRetryableGeminiError(err) && attempt < RETRY_WAITS_MS.length;
-      if (!canRetry) throw err;
-
-      const wait = RETRY_WAITS_MS[attempt];
-      const label =
-        err instanceof ApiError
-          ? String(err.status)
-          : err instanceof TimeoutError
-            ? "timeout"
-            : "network";
-      console.warn(
-        `Gemini ${label} on ${model}; retrying in ${wait}ms (${attempt + 1}/3)…`
-      );
-      await sleep(wait);
-    }
-  }
-
-  throw lastErr;
-}
-
 async function askGemini(chatId: number, userText: string): Promise<string> {
-  const history = getHistory(chatId);
-
-  // Add the new user message to the contents we send
+  // Drop a broken history (starts with the model, or a user turn that failed).
+  const history = usableHistory(getHistory(chatId));
   const contents: Content[] = [
     ...history,
     { role: "user", parts: [{ text: userText }] },
   ];
 
-  let response;
-  try {
-    response = await generateWithRetries(GEMINI_MODEL, contents);
-  } catch (err) {
-    // Still failing after retries → one shot with the fallback model
-    if (!isRetryableGeminiError(err)) throw err;
-    console.warn(
-      `Primary model failed; trying fallback ${GEMINI_FALLBACK_MODEL}…`
-    );
-    response = await generateOnce(GEMINI_FALLBACK_MODEL, contents);
-  }
+  const response = await tryModels(
+    GEMINI_MODELS,
+    (model, timeoutMs) => callGemini(model, contents, timeoutMs),
+    TOTAL_BUDGET_MS
+  );
 
   const reply = response.text?.trim() || "I don't have a response for that.";
 
-  // Save user + model turns, then trim to last 20
+  // Save only after a reply, so a failed call cannot leave two user turns in a row.
   setHistory(chatId, [
     ...contents,
     { role: "model", parts: [{ text: reply }] },
