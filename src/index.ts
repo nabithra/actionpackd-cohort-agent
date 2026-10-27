@@ -1,8 +1,9 @@
 import "dotenv/config";
 import { readFileSync } from "fs";
 import { join } from "path";
-import { Bot, GrammyError } from "grammy";
+import { Bot, Context, GrammyError } from "grammy";
 import { ApiError, GoogleGenAI, type Content } from "@google/genai";
+import { htmlToPlainText, markdownToTelegramHtml, splitMessage } from "./format";
 
 // --- Config (fail fast if required env vars are missing) ---
 
@@ -110,25 +111,6 @@ function isThinkingConfigRejected(err: unknown): boolean {
 
 function is409Conflict(err: unknown): boolean {
   return err instanceof GrammyError && err.error_code === 409;
-}
-
-/** Split a long reply into chunks under Telegram's safe limit. */
-function splitMessage(text: string, maxLen = 4000): string[] {
-  if (text.length <= maxLen) return [text];
-
-  const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > maxLen) {
-    // Prefer splitting on a newline near the limit
-    let cut = remaining.lastIndexOf("\n", maxLen);
-    if (cut < maxLen / 2) cut = maxLen;
-    chunks.push(remaining.slice(0, cut));
-    remaining = remaining.slice(cut).trimStart();
-  }
-
-  if (remaining.length > 0) chunks.push(remaining);
-  return chunks;
 }
 
 async function callGemini(
@@ -251,6 +233,25 @@ bot.command("reset", async (ctx) => {
   await ctx.reply("Conversation cleared. What's next?");
 });
 
+/** True when Telegram rejected parse_mode HTML ("can't parse entities"). */
+function isHtmlParseError(err: unknown): boolean {
+  if (!(err instanceof GrammyError) || err.error_code !== 400) return false;
+  const description = `${err.description} ${err.message}`.toLowerCase();
+  return description.includes("parse entities");
+}
+
+/** Send one chunk as HTML. If Telegram can't parse it, resend plain text. */
+async function replyHtmlOrPlain(ctx: Context, html: string): Promise<void> {
+  try {
+    await ctx.reply(html, { parse_mode: "HTML" });
+  } catch (err) {
+    if (!isHtmlParseError(err)) throw err;
+    console.warn("Telegram rejected the HTML; sending this part as plain text");
+    const plain = htmlToPlainText(html).trim();
+    if (plain) await ctx.reply(plain);
+  }
+}
+
 // Text messages → Gemini
 bot.on("message:text", async (ctx) => {
   const chatId = ctx.chat.id;
@@ -266,10 +267,17 @@ bot.on("message:text", async (ctx) => {
 
   try {
     const reply = await askGemini(chatId, userText);
-    const chunks = splitMessage(reply);
+    // History keeps Gemini's Markdown. Only the Telegram send is HTML.
+    const chunks = splitMessage(markdownToTelegramHtml(reply)).filter((chunk) =>
+      chunk.trim()
+    );
 
-    for (const chunk of chunks) {
-      await ctx.reply(chunk);
+    if (chunks.length === 0) {
+      await ctx.reply("I don't have a response for that.");
+    } else {
+      for (const chunk of chunks) {
+        await replyHtmlOrPlain(ctx, chunk);
+      }
     }
   } catch (err) {
     // Log the error (never log secrets) and keep the bot alive
